@@ -25,17 +25,55 @@ object Par {
     }
   
   def fork[A](a: => Par[A]): Par[A] = // This is the simplest and most natural implementation of `fork`, but there are some problems with it--for one, the outer `Callable` will block waiting for the "inner" task to complete. Since this blocking occupies a thread in our thread pool, or whatever resource backs the `ExecutorService`, this implies that we're losing out on some potential parallelism. Essentially, we're using two threads when one should suffice. This is a symptom of a more serious problem with the implementation, and we will discuss this later in the chapter.
-    es => es.submit(new Callable[A] { 
+    es => es.submit(new Callable[A] {
       def call = a(es).get
     })
+
+  def lazyUnit[A](a: => A): Par[A] =
+    fork(unit(a))
+
+  def asyncF[A, B](f: A => B): A => Par[B] =
+    a => lazyUnit(f(a))
 
   def map[A,B](pa: Par[A])(f: A => B): Par[B] = 
     map2(pa, unit(()))((a,_) => f(a))
 
   def sortPar(parList: Par[List[Int]]) = map(parList)(_.sorted)
 
-  def equal[A](e: ExecutorService)(p: Par[A], p2: Par[A]): Boolean = 
-    p(e).get == p2(e).get
+  def sequenceSimple[A](lp: List[Par[A]]): Par[List[A]] =
+    lp.foldRight(unit(List[A]()))(map2(_, _)(_ :: _))
+
+  // We define `sequenceBalanced` using `IndexedSeq`, which provides an
+  // efficient function for splitting the sequence in half.
+  def sequenceBalanced[A](as: IndexedSeq[Par[A]]): Par[IndexedSeq[A]] = fork {
+    if (as.isEmpty) unit(Vector())
+    else if (as.length == 1) map(as.head)(a => Vector(a))
+    else {
+      val (l,r) = as.splitAt(as.length/2)
+      map2(sequenceBalanced(l), sequenceBalanced(r))(_ ++ _)
+    }
+  }
+
+  def sequence[A](as: List[Par[A]]): Par[List[A]] =
+    map(sequenceBalanced(as.toIndexedSeq))(_.toList)
+
+  def parMap[A,B](la: List[A])(f: A => B): Par[List[B]] = fork {
+    val fbs: List[Par[B]] = la.map(asyncF(f))
+    sequence(fbs)
+  }
+
+  def parFilterSimple[A](la: List[A])(f: A => Boolean): Par[List[A]] = {
+    val pl = parMap(la)(a => (a, f(a)))
+    map(pl)(_ filter(_ _2) map(_ _1))
+  }
+
+  def parFilter[A](la: List[A])(f: A => Boolean): Par[List[A]] = {
+    val lpl = la.map(asyncF(List(_).filter(f)))
+    map(sequence(lpl))(_.flatten)
+  }
+
+  def equal[A](p: Par[A], p2: Par[A]): Par[Boolean] =
+    Par.map2(p,p2)(_ == _)
 
   def delay[A](fa: => Par[A]): Par[A] = 
     es => fa(es)
@@ -45,11 +83,52 @@ object Par {
       if (run(es)(cond).get) t(es) // Notice we are blocking on the result of `cond`.
       else f(es)
 
+  def choiceN[A](n: Par[Int])(choices: List[Par[A]]): Par[A] =
+    es => {
+      val index = run(es)(n).get
+      choices(index)(es)
+    }
+
+  def choiceMap[K, V](key: Par[K])(choices: Map[K,Par[V]]): Par[V] =
+    es => {
+      val k = key(es).get
+      choices(k)(es)
+    }
+
+  def choiceViaChoiceN[A](cond: Par[Boolean])(t: Par[A], f: Par[A]): Par[A] =
+    choiceN(map(cond)(if(_) 0 else 1))(List(t, f))
+
+  def chooser[A, B](pa: Par[A])(choice: A => Par[B]): Par[B] =
+    es => {
+      val a = pa(es).get
+      choice(a)(es)
+    }
+
+  def flatMap[A, B](pa: Par[A])(f: A => Par[B]): Par[B] =
+    es => {
+      val a = pa(es).get
+      f(a)(es)
+    }
+
+  def choiceViaChooser[A](cond: Par[Boolean])(t: Par[A], f: Par[A]): Par[A] =
+    chooser(cond)(if(_) t else f)
+
+  def choiceNChooser[A](n: Par[Int])(choices: List[Par[A]]): Par[A] =
+    chooser(n)(choices(_))
+
+  def join[A](ppa: Par[Par[A]]): Par[A] =
+    es => ppa(es).get() (es)
+
+  def joinViaFlatMap[A](ppa: Par[Par[A]]): Par[A] =
+    flatMap(ppa)(identity)
+
+  def flatMapViaJoin[A, B](pa: Par[A])(f: A => Par[B]): Par[B] =
+    join(map(pa)(f))
+
   /* Gives us infix syntax for `Par`. */
   implicit def toParOps[A](p: Par[A]): ParOps[A] = new ParOps(p)
 
   class ParOps[A](p: Par[A]) {
-
 
   }
 }

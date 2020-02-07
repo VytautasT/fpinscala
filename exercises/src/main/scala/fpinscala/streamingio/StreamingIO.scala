@@ -136,7 +136,15 @@ object SimpleStreamTransducers {
     /*
      * Exercise 5: Implement `|>`. Let the types guide your implementation.
      */
-    def |>[O2](p2: Process[O,O2]): Process[I,O2] = ???
+    def |>[O2](p2: Process[O,O2]): Process[I,O2] = p2 match {
+      case Halt() => Halt()
+      case Emit(h,t) => Emit(h, this |> t)
+      case Await(g) => this match {
+        case Emit(h,t) => t |> g(Some(h))
+        case Halt() => Halt() |> g(None)
+        case Await(f) => Await(i => f(i) |> p2)
+      }
+    }
 
     /*
      * Feed `in` to this `Process`. Uses a tail recursive loop as long
@@ -200,7 +208,11 @@ object SimpleStreamTransducers {
     /*
      * Exercise 6: Implement `zipWithIndex`.
      */
-    def zipWithIndex: Process[I,(O,Int)] = ???
+    def zip[O2](p2: Process[I,O2]): Process[I, (O, O2)] =
+      zipWith(this, p2)((_, _))
+
+    def zipWithIndex: Process[I,(O,Int)] =
+      this zip count.map(_ - 1)
 
     /* Add `p` to the fallback branch of this process */
     def orElse(p: Process[I,O]): Process[I,O] = this match {
@@ -245,7 +257,7 @@ object SimpleStreamTransducers {
     implicit def toMonadic[I,O](a: Process[I,O]) = monad[I].toMonadic(a)
 
     /**
-     * A helper function to await an element or fall back to another process
+     * A helper function to await an element or fall back to anotherE process
      * if there is no input.
      */
     def await[I,O](f: I => Process[I,O],
@@ -292,13 +304,33 @@ object SimpleStreamTransducers {
     /*
      * Exercise 1: Implement `take`, `drop`, `takeWhile`, and `dropWhile`.
      */
-    def take[I](n: Int): Process[I,I] = ???
+    def take[I](n: Int): Process[I,I] =
+      Await {
+        case Some(i) if n > 0 => Emit(i, take(n - 1))
+        case _ => Halt()
+      }
 
-    def drop[I](n: Int): Process[I,I] = ???
 
-    def takeWhile[I](f: I => Boolean): Process[I,I] = ???
+    def drop[I](n: Int): Process[I,I] =
+      Await {
+        case Some(i) =>
+          if (n > 0) drop(n - 1)
+          else Emit(i, id)
+        case None => Halt()
+      }
 
-    def dropWhile[I](f: I => Boolean): Process[I,I] = ???
+    def takeWhile[I](f: I => Boolean): Process[I,I] =
+      Await {
+        case Some(i) if f(i) => Emit(i, takeWhile(f))
+        case _ => Halt()
+      }
+
+    def dropWhile[I](f: I => Boolean): Process[I,I] =
+      Await {
+        case Some(i) if f(i) => dropWhile(f)
+        case Some(i) => Emit(i, id)
+        case None => Halt()
+      }
 
     /* The identity `Process`, just repeatedly echos its input. */
     def id[I]: Process[I,I] = lift(identity)
@@ -306,7 +338,11 @@ object SimpleStreamTransducers {
     /*
      * Exercise 2: Implement `count`.
      */
-    def count[I]: Process[I,Int] = ???
+    def count[I]: Process[I,Int] = {
+      def go(n: Int): Process[I,Int] =
+        await(_ => emit(n + 1, go(n + 1)))
+      go(0)
+    }
 
     /* For comparison, here is an explicit recursive implementation. */
     def count2[I]: Process[I,Int] = {
@@ -318,7 +354,15 @@ object SimpleStreamTransducers {
     /*
      * Exercise 3: Implement `mean`.
      */
-    def mean: Process[Double,Double] = ???
+    def mean: Process[Double,Double] = {
+      def go(n: Int, sum: Double): Process[Double,Double] =
+        await((d: Double) => {
+          val n2 = n + 1
+          val sum2 = sum + d
+          emit(sum2 / n2, go(n2, sum2))
+        })
+      go(0, 0.0)
+    }
 
     def loop[S,I,O](z: S)(f: (I,S) => (O,S)): Process[I,O] =
       await((i: I) => f(i,z) match {
@@ -327,15 +371,22 @@ object SimpleStreamTransducers {
 
     /* Exercise 4: Implement `sum` and `count` in terms of `loop` */
 
-    def sum2: Process[Double,Double] = ???
+    def sum2: Process[Double,Double] =
+      loop(0.0)((i, s) => (i + s, i + s))
 
-    def count3[I]: Process[I,Int] = ???
+    def count3[I]: Process[I,Int] =
+      loop(0)((_, s) => (s + 1, s + 1))
 
     /*
      * Exercise 7: Can you think of a generic combinator that would
      * allow for the definition of `mean` in terms of `sum` and
      * `count`?
      */
+    def zipWith[I,O1,O2,O3](p1: Process[I,O1], p2: Process[I,O2])(f: (O1,O2)=>O3): Process[I, O3] = for {
+      o1 <- p1
+      o2 <- p2
+    } yield f(o1, o2)
+
 
     def feed[A,B](oa: Option[A])(p: Process[A,B]): Process[A,B] =
       p match {
@@ -503,7 +554,16 @@ object GeneralizedStreamTransducers {
      * below, this is not tail recursive and responsibility for stack safety
      * is placed on the `Monad` instance.
      */
-    def runLog(implicit F: MonadCatch[F]): F[IndexedSeq[O]] = ???
+    def runLog(implicit F: MonadCatch[F]): F[IndexedSeq[O]] = {
+      def go(cur: Process[F,O], acc: IndexedSeq[O]): F[IndexedSeq[O]] =
+        cur match {
+          case Emit(h,t) => go(t, acc :+ h)
+          case Halt(End) => F.unit(acc)
+          case Halt(err) => F.fail(err)
+          case Await(req,recv) => F.flatMap (F.attempt(req)) { e => go(Try(recv(e)), acc) }
+        }
+      go(this, IndexedSeq())
+    }
 
     /*
      * We define `Process1` as a type alias - see the companion object
@@ -744,10 +804,16 @@ object GeneralizedStreamTransducers {
         { src => eval_ { IO(src.close) } }
 
     /* Exercise 11: Implement `eval`, `eval_`, and use these to implement `lines`. */
-    def eval[F[_],A](a: F[A]): Process[F,A] = ???
+    def eval[F[_],A](a: F[A]): Process[F,A] =
+      await(a) {
+        case Left(e) => Halt(e)
+        case Right(v) => emit(v)
+      }
+
 
     /* Evaluate the action purely for its effects. */
-    def eval_[F[_],A,B](a: F[A]): Process[F,B] = ???
+    def eval_[F[_],A,B](a: F[A]): Process[F,B] =
+      eval(a).drain
 
     /* Helper function with better type inference. */
     def evalIO[A](a: IO[A]): Process[IO,A] =
@@ -908,7 +974,8 @@ object GeneralizedStreamTransducers {
       eval(IO(a)).flatMap { a => Emit(a, constant(a)) }
 
     /* Exercise 12: Implement `join`. Notice this is the standard monadic combinator! */
-    def join[F[_],A](p: Process[F,Process[F,A]]): Process[F,A] = ???
+    def join[F[_],A](p: Process[F,Process[F,A]]): Process[F,A] =
+      p flatMap identity
 
     /*
      * An example use of the combinators we have so far: incrementally
